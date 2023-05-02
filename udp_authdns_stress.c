@@ -60,13 +60,17 @@ struct dnshdr {
 typedef struct ip_udp_payload_t {
     struct ip ip_hdr;
     struct udphdr udp_hdr;
-    char payload[0];
+    /* Do not use payload[0] for zero-length array pointer; use payload[] */
+    char payload[];
 } ip_udp_payload_t;
 
 typedef struct ip_udp_dns_payload_t {
     ip_udp_payload_t ip_udp_payload;
     struct dnshdr dns_hdr;
-    char dns_payload[0];
+    /* Do not use dns_payload[0] for zero-length array pointer. It trips */
+    /* the FORTIFY_SOURCE detection on gcc 11.30 with -O1 and above, */
+    /* causing snprintf() to abort() due to a "0 size target buffer". */
+    char dns_payload[];
 } ip_udp_dns_payload_t;
 
 typedef struct ip_packet_t {
@@ -102,6 +106,7 @@ void mac_to_sll_addr(const char *mac, unsigned char *sll_addr6);
 int parse_args(
         int argc, char *const *argv, const char **ifname, unsigned char *mac,
         struct in_addr *ip, unsigned *count);
+void hexdump(const void *ptr, unsigned length);
 
 int main(int argc, char *const *argv) {
     const char *target_ifname; /* eth0 */
@@ -175,10 +180,37 @@ int main(int argc, char *const *argv) {
     }
     {
         int ret = qname_printf(
-            &ip_packet, "\x07" "example" "\x03" "com" "\x00", 0);
+            /* www.example.com. */
+            &ip_packet, ("\x03" "www" "\x07" "example" "\x03" "com"), 0);
         ip_packet.packet_len += ret;
     }
     finalize_packet(&ip_packet);
+
+#if 1
+#define F "%02hhx"
+#define FM F ":"
+#define A(x) device.sll_addr[x]
+#define HD(s, b, l) do { \
+        printf("  " s " ="); hexdump(b, l); printf("\n"); } while(0)
+#define HDS(s, b) HD(s, &b, sizeof(b))
+    printf("Layer 2:\n");
+    printf("  gateway_interface = %s\n", target_ifname);
+    printf("  gateway_mac_address = " FM FM FM FM FM F "\n",
+        A(0), A(1), A(2), A(3), A(4), A(5));
+    printf("Layer 3:\n");
+    HDS("ip4", ip_packet.ip_udp_payload.ip_hdr);
+    HDS("udp", ip_packet.ip_udp_payload.udp_hdr);
+    HD(
+        "dns", &ip_packet.ip_udp_dns_payload.dns_hdr,
+        ip_packet.packet_len - (
+            (void *)&ip_packet.ip_udp_dns_payload.dns_hdr -
+            (void *)&ip_packet.ip_udp_payload.ip_hdr));
+#undef HDS
+#undef HD
+#undef A
+#undef FM
+#undef F
+#endif
 
     /* do a run */
     alter_and_send(raw_socket, &device, &ip_packet, 0, target_count);
@@ -205,6 +237,19 @@ int parse_args(
     return 1;
 }
 
+void hexdump(const void *ptr, unsigned length) {
+    const uint16_t *ptr16 = ptr;
+    unsigned i;
+    const unsigned l16 = length / 2;
+    for (i = 0; i < l16; ++i) {
+        printf(" %04hx", ntohs(ptr16[i]));
+    }
+    if (length % 2 != 0) {
+        const uint8_t *ptr8 = ptr;
+        printf(" %02hx", ptr8[length - 1]);
+    }
+}
+
 void finalize_packet(ip_packet_t *ip_packet) {
     struct ip *ip_hdr = &ip_packet->ip_udp_payload.ip_hdr;
     struct udphdr *udp_hdr = &ip_packet->ip_udp_payload.udp_hdr;
@@ -215,15 +260,15 @@ void finalize_packet(ip_packet_t *ip_packet) {
             ip_packet->packet_len - (ip_hdr->ip_hl << 2));
     }
     {
-        /* this is mandatory */
+        /* ip_checksum: this is mandatory */
         ip_hdr->ip_sum = 0; /* blank while calculating */
         ip_hdr->ip_sum = ip_checksum(
             (const uint16_t *)ip_hdr, sizeof(*ip_hdr));
     }
     {
-        /* this is optional, udp checksum is allowed to be zero */
-        /* set extra NUL which aids the udp4_checksum padding */
+        /* udp4_checksum: this is optional, zero is a legal alternative */
         assert(ip_packet->packet_len < ip_packet->packet_max);
+        /* set extra NUL which aids the udp4_checksum padding */
         ip_packet->octets[ip_packet->packet_len] = '\0';
         udp_hdr->check = 0; /* blank while calculating */
         udp_hdr->check = udp4_checksum(&ip_packet->ip_udp_payload);
@@ -233,7 +278,7 @@ void finalize_packet(ip_packet_t *ip_packet) {
 int qname_printf(ip_packet_t *ip_packet, const char *qname, unsigned number) {
     char *buf = ip_packet->ip_udp_dns_payload.dns_payload;
     const char *end = (const char *)ip_packet->octets + ip_packet->packet_max;
-    const int max = (end - buf) - 6;
+    const int max = (end - buf) - 6; /* +1 room for udp4_checksum pad */
     int ret;
 
     ret = snprintf(buf, max, qname, number);
@@ -241,14 +286,15 @@ int qname_printf(ip_packet_t *ip_packet, const char *qname, unsigned number) {
         errno = ENOMEM;
         return -1;
     }
-    buf[ret++] = '\0';
-    /* QTYPE_A */
+    /* snprintf() will have added the "\x00" for the root DNS label, */
+    /* because it's also the C-string terminator */
+    ++ret;
+    /* QTYPE_A in big endian*/
     buf[ret++] = 0;
     buf[ret++] = 1;
-    /* QCLASS_IN */
+    /* QCLASS_IN in big endian */
     buf[ret++] = 0;
     buf[ret++] = 1;
-    /* udp4_checksum code wants a sixth byte here */
 
     return ret;
 }
@@ -294,12 +340,11 @@ void alter_and_send(
                     ((unsigned char *)src)[2] = octet3;
                     ((unsigned char *)src)[3] = octet4;
                     /* alter QNAME: DNS names consist of [size][name*] */
-                    /* up to the root, where the root-name has size 0. */
+                    /* up to the root, where the root label has size 0. */
                     /* For example: [3]www[7]example[3]com[0] */
                     /* qname_printf() also adds the type and the qclass */
                     ret = qname_printf(ip_packet, (
-                        "\x0bt%010u"
-                        "\x07" "example" "\x03" "com"), unique++);
+                        "\x0bt%010u" "\x07" "example" "\x03" "com"), unique++);
                     if (ret < 0) {
                         perror("qname_printf");
                         return;
